@@ -1,8 +1,7 @@
 // ==========================================
 // 1. 全域變數與設定
 // ==========================================
-const API_URL = 'https://data.ntpc.gov.tw/api/v1/openapi/units/1130000';
-const CSV_PATH = '新北市公共自行車租賃系統(YouBike2.0).csv'; // 備用檔案名稱一併修改
+const API_URL = 'https://data.ntpc.gov.tw/api/datasets/71cd1490-a2df-4198-bef1-318479775e8a/json?page=0&size=2000';
 
 let stations = [];
 let filteredStations = [];
@@ -13,8 +12,6 @@ let lastFetchTime = 0;
 let updateInterval = 60000; // 60秒更新一次
 let isLoading = true;
 let hasError = false;
-let isLocalMode = false; // 標記是否為手動上傳檔案模式
-let fileInput; // 手動上傳檔案的 HTML 元素
 let loadingProgress = 0; // 載入進度百分比
 let loadingState = "建立連線中..."; // 載入狀態文字
 let dataModeStr = "初始化"; // 當前資料來源模式
@@ -35,16 +32,11 @@ const CARD_MARGIN = 20;
 // 調色盤物件
 let colors;
 
-// Mappa 地圖相關變數
-let mappa;
-let myMap;
-let p5canvas;
-
 // ==========================================
 // 2. p5.js 生命週期函數
 // ==========================================
 function setup() {
-  p5canvas = createCanvas(windowWidth, windowHeight);
+  createCanvas(windowWidth, windowHeight);
   
   // 初始化 Cyberpunk 調色盤
   colors = {
@@ -56,56 +48,18 @@ function setup() {
     disabled: color(70, 78, 95)
   };
 
-  // 初始化 Mappa (使用 Leaflet 作為底圖引擎)
-  mappa = new Mappa('Leaflet');
-  const mapOptions = {
-    lat: 25.0115, // 新北市中心座標 (大約在板橋)
-    lng: 121.4619,
-    zoom: 12,
-    style: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" // 採用深色地圖以符合 Cyberpunk 風格
-  };
-  // 建立地圖並將 p5 畫布疊加上去
-  myMap = mappa.tileMap(mapOptions);
-  myMap.overlay(p5canvas);
-
   // 啟動資料拉取
   fetchData();
-
-  // 建立一個隱藏的檔案上傳按鈕 (當抓取失敗時提供手動上傳)
-  fileInput = document.createElement('input');
-  fileInput.type = 'file';
-  fileInput.accept = '.csv';
-  fileInput.style.position = 'absolute';
-  fileInput.style.left = '50%';
-  fileInput.style.top = '60%';
-  fileInput.style.transform = 'translate(-50%, -50%)';
-  fileInput.style.display = 'none';
-  fileInput.style.color = '#fff';
-  fileInput.style.zIndex = '9999'; // 確保檔案按鈕不會被地圖圖層遮擋
-  fileInput.addEventListener('change', (e) => {
-    let file = e.target.files[0];
-    if (!file) return;
-    let reader = new FileReader();
-    reader.onload = (evt) => {
-      fileInput.style.display = 'none';
-      isLocalMode = true; // 切換至本地模式，停止自動重試
-      hasError = false;
-      processCSV(evt.target.result, "手動上傳 (本地 CSV)");
-    };
-    reader.readAsText(file);
-  });
-  document.body.appendChild(fileInput);
 }
 
 function draw() {
-  clear(); // 清除畫布背景，讓底下的 Mappa 地圖可以透出來
-  background(11, 14, 23, 190); // 覆蓋一層半透明深色遮罩，讓卡片與文字能清楚閱讀
+  background(colors.bg);
 
   if (isLoading || hasError) {
     drawLoading();
 
     // 即使連線失敗，也允許每隔 60 秒嘗試重新拉取資料
-    if (!isLocalMode && millis() - lastFetchTime > updateInterval) {
+    if (millis() - lastFetchTime > updateInterval) {
       isLoading = true;
       hasError = false;
       fetchData();
@@ -115,7 +69,7 @@ function draw() {
   }
 
   // 定期資料刷新機制
-  if (!isLocalMode && millis() - lastFetchTime > updateInterval) {
+  if (millis() - lastFetchTime > updateInterval) {
     fetchData();
   }
 
@@ -180,12 +134,13 @@ async function fetchData() {
 
   try {
     // 1. 在原 API 網址加上時間戳，確保抓到最新狀態而不被代理伺服器快取
-    let targetUrl = API_URL + '?t=' + Date.now();
-    // 2. 使用公共的 CORS 代理伺服器發送 GET 請求，繞過瀏覽器 CORS 限制
-    let proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(targetUrl);
-
+    let timeConnector = API_URL.includes('?') ? '&' : '?';
+    let targetUrl = API_URL + timeConnector + 't=' + Date.now();
+    
+    // 2. 依照需求，直接使用代理伺服器發送 GET 請求，繞過 127.0.0.1 的 CORS 限制
+    let proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(targetUrl);
     let response = await fetch(proxyUrl);
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    if (!response.ok) throw new Error(`Proxy fetch failed: ${response.status}`);
     
     // 建立 clone 以安全地解析 JSON，避免我們手動分塊導致中文字元截斷報錯
     let responseClone = response.clone();
@@ -216,33 +171,11 @@ async function fetchData() {
     let rawData = await responseClone.json();
     processData(rawData, "即時連線");
   } catch (apiError) {
-    console.warn("API Fetch 失敗 (可能為 CORS 或網路異常)，啟動降級機制讀取本地 CSV...", apiError);
-    try {
-      let csvResponse = await fetch(CSV_PATH);
-      if (!csvResponse.ok) throw new Error('本地 CSV 檔案不存在或無法讀取');
-      let csvText = await csvResponse.text();
-      processCSV(csvText, "降級備用 (本地 CSV)");
-    } catch (csvError) {
-      console.error("本地 CSV 也讀取失敗！", csvError);
-      hasError = true;
-      isLoading = false;
-    }
+    console.error("即時 API 連線徹底失敗：", apiError);
+    loadingState = "網路連線異常";
+    hasError = true;
+    isLoading = false;
   }
-}
-
-function processCSV(csvText, mode = "本地 CSV") {
-  let lines = csvText.trim().split('\n');
-  let headers = lines[0].split(',').map(h => h.trim().replace(/['"]/g, ''));
-  let data = [];
-  
-  for (let i = 1; i < lines.length; i++) {
-    if(!lines[i]) continue;
-    let row = lines[i].split(',').map(v => v.trim().replace(/['"]/g, ''));
-    let obj = {};
-    headers.forEach((h, idx) => { obj[h] = row[idx]; });
-    data.push(obj);
-  }
-  processData(data, mode);
 }
 
 function processData(data, mode = "即時連線") {
@@ -555,13 +488,11 @@ function drawLoading() {
   textAlign(CENTER, CENTER);
   if (hasError) {
     fill(colors.warning);
-    text("資料載入失敗！", width / 2, height / 2 - 40);
+    text("即時資料載入失敗！", width / 2, height / 2 - 40);
     fill(200);
     textSize(16);
-    text("請確認是否使用 Live Server 啟動 (避免瀏覽器 file:// 阻擋)\n或點擊下方按鈕，直接手動選擇您已下載的 CSV 檔案：", width / 2, height / 2 + 10);
-    if (fileInput) fileInput.style.display = 'block';
+    text("請確認您的網路連線是否正常，系統將會在 60 秒後自動重新嘗試連線。", width / 2, height / 2 + 10);
   } else {
-    if (fileInput) fileInput.style.display = 'none';
     fill(colors.bemp);
     text(loadingState, width / 2, height / 2 - 30);
     
