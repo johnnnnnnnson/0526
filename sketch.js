@@ -1,7 +1,7 @@
 // ==========================================
 // 1. 全域變數與設定
 // ==========================================
-const API_URL = 'https://data.ntpc.gov.tw/api/datasets/71cd1490-a2df-4198-bef1-318479775e8a/json?page=0&size=2000';
+const API_URL = 'https://data.ntpc.gov.tw/api/datasets/010e5b15-3823-4b20-b401-b1cf000550c5/json?page=0&size=2000';
 
 let stations = [];
 let filteredStations = [];
@@ -12,10 +12,7 @@ let lastFetchTime = 0;
 let updateInterval = 60000; // 60秒更新一次
 let isLoading = true;
 let hasError = false;
-let loadingProgress = 0; // 載入進度百分比
-let loadingState = "建立連線中..."; // 載入狀態文字
-let dataModeStr = "初始化"; // 當前資料來源模式
-let officialDataTime = "載入中"; // 官方資料發布時間
+let errorMessage = ""; // 儲存具體的錯誤訊息
 
 // 滾動與 UI 排版變數
 let scrollY = 0;
@@ -55,21 +52,19 @@ function setup() {
 function draw() {
   background(colors.bg);
 
-  if (isLoading || hasError) {
+  // 初次載入或完全沒有資料時，才顯示全螢幕的載入/錯誤畫面
+  if (stations.length === 0 && (isLoading || hasError)) {
     drawLoading();
 
-    // 即使連線失敗，也允許每隔 60 秒嘗試重新拉取資料
-    if (millis() - lastFetchTime > updateInterval) {
-      isLoading = true;
-      hasError = false;
+    // 初次連線若失敗，允許每隔 60 秒自動嘗試重新拉取資料
+    if (hasError && millis() - lastFetchTime > updateInterval) {
       fetchData();
     }
-
     return;
   }
 
-  // 定期資料刷新機制
-  if (millis() - lastFetchTime > updateInterval) {
+  // 背景定期資料刷新機制 (不干擾現有畫面卡片)
+  if (!isLoading && millis() - lastFetchTime > updateInterval) {
     fetchData();
   }
 
@@ -112,6 +107,9 @@ function draw() {
   // ==========================================
   drawTopPanel();
   drawFilterPanel();
+
+  // 繪製右下角手動更新(重製)按鈕
+  drawRefreshButton();
 }
 
 function windowResized() {
@@ -129,67 +127,46 @@ async function fetchData() {
   // 每次進入 Fetch 都先更新計時器，避免失敗後引發無限迴圈或當機
   lastFetchTime = millis();
   
-  loadingProgress = 0;
-  loadingState = "建立連線中...";
+  isLoading = true;
+  hasError = false;
+  errorMessage = "";
 
   try {
-    // 1. 在原 API 網址加上時間戳，確保抓到最新狀態而不被代理伺服器快取
-    let timeConnector = API_URL.includes('?') ? '&' : '?';
-    let targetUrl = API_URL + timeConnector + 't=' + Date.now();
-    
-    // 2. 依照需求，直接使用代理伺服器發送 GET 請求，繞過 127.0.0.1 的 CORS 限制
-    let proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(targetUrl);
-    let response = await fetch(proxyUrl);
-    if (!response.ok) throw new Error(`Proxy fetch failed: ${response.status}`);
-    
-    // 建立 clone 以安全地解析 JSON，避免我們手動分塊導致中文字元截斷報錯
-    let responseClone = response.clone();
-    
-    loadingState = "下載資料中...";
-    
-    // 使用 ReadableStream 即時讀取下載進度
-    const reader = response.body.getReader();
-    const contentLength = +response.headers.get('Content-Length');
-    // 代理伺服器可能不提供檔案大小，若無則以台北市 YouBike 資料量約 600KB 進行預估
-    const estimatedLength = contentLength ? contentLength : 600000; 
-    
-    let receivedLength = 0;
-    let chunks = [];
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      receivedLength += value.length;
-      // 計算百分比，最多卡在 99.9% 直到解析完成
-      loadingProgress = min((receivedLength / estimatedLength) * 100, 99.9);
+    let targetUrl = API_URL + '&t=' + Date.now();
+    let encodedUrl = encodeURIComponent(targetUrl);
+    let response;
+
+    try {
+      // 優先嘗試使用 corsproxy.io
+      response = await fetch('https://corsproxy.io/?' + encodedUrl);
+      if (!response.ok) throw new Error('corsproxy failed');
+    } catch (e) {
+      // 若失敗或被擋廣告套件攔截，自動切換至 allorigins
+      response = await fetch('https://api.allorigins.win/raw?url=' + encodedUrl);
+      if (!response.ok) throw new Error(`連線錯誤: ${response.status}`);
     }
     
-    loadingState = "解析資料中...";
-    loadingProgress = 100;
-    
-    // 讓原生 .json() 安全處理字串與格式，避免我們手動分塊導致的中文字元截斷錯誤
-    let rawData = await responseClone.json();
-    processData(rawData, "即時連線");
+    let rawData = await response.json();
+    processData(rawData);
   } catch (apiError) {
     console.error("即時 API 連線徹底失敗：", apiError);
-    loadingState = "網路連線異常";
+    // 針對 Failed to fetch 轉換為更明確的中文提示
+    if (apiError.message === "Failed to fetch" || apiError.message === "NetworkError when attempting to fetch resource.") {
+      errorMessage = "網路異常，或代理伺服器遭瀏覽器/擋廣告套件(如 uBlock) 攔截";
+    } else {
+      errorMessage = apiError.message || "未知錯誤";
+    }
     hasError = true;
     isLoading = false;
   }
 }
 
-function processData(data, mode = "即時連線") {
-  dataModeStr = mode;
+function processData(data) {
   // 容錯處理：如果 API 回傳的不是陣列而是物件包裹，試著提取出來
   if (!Array.isArray(data)) {
     if (data && Array.isArray(data.result)) data = data.result;
     else if (data && Array.isArray(data.records)) data = data.records;
     else data = [];
-  }
-
-  // 嘗試取得官方資料更新時間
-  if (data.length > 0) {
-    officialDataTime = data[0].srcUpdateTime || data[0].updateTime || data[0].mday || "未知";
   }
 
   let newDistricts = new Set(['全部']);
@@ -355,11 +332,18 @@ function drawTopPanel() {
   fill(colors.bg);
   rect(0, 0, width, TOP_PANEL_H);
 
-  // 頂部倒數計時進度條
-  let timeLeft = max(0, updateInterval - (millis() - lastFetchTime));
-  let progress = timeLeft / updateInterval;
-  fill(colors.sbi);
-  rect(0, 0, width * progress, 3);
+  // 頂部倒數計時進度條與背景更新狀態
+  if (isLoading) {
+    // 載入中的呼吸燈特效
+    let pulse = (sin(frameCount * 0.1) + 1) / 2;
+    fill(colors.bemp);
+    rect(0, 0, width * pulse, 3);
+  } else {
+    let timeLeft = max(0, updateInterval - (millis() - lastFetchTime));
+    let progress = timeLeft / updateInterval;
+    fill(hasError ? colors.warning : colors.sbi);
+    rect(0, 0, width * progress, 3);
+  }
 
   // 大標題
   fill(255);
@@ -368,15 +352,20 @@ function drawTopPanel() {
   textAlign(LEFT, CENTER);
   text("NEW TAIPEI YOUBIKE 2.0", 25, TOP_PANEL_H / 2 - 8);
 
-  // 更新時間
+  // 更新時間或更新中提示字樣
   textFont('Noto Sans TC');
   textSize(13);
-  let d = new Date(Date.now() - (millis() - lastFetchTime));
-  let fetchTimeStr = d.toLocaleTimeString('zh-TW', { hour12: false });
-  
-  // 若非即時連線，用警戒色提示使用者這不是最新資料
-  fill(dataModeStr.includes("即時連線") ? 150 : colors.warning);
-  text(`連線狀態: ${dataModeStr} | 抓取時間: ${fetchTimeStr} | 官方更新時間: ${officialDataTime}`, 25, TOP_PANEL_H / 2 + 18);
+  if (isLoading) {
+    fill(colors.bemp);
+    text("🔄 背景資料同步更新中...", 25, TOP_PANEL_H / 2 + 18);
+  } else if (hasError) {
+    fill(colors.warning);
+    text(`⚠️ 連線異常，目前顯示快取資料 (將自動重試)`, 25, TOP_PANEL_H / 2 + 18);
+  } else {
+    fill(150);
+    let d = new Date(Date.now() - (millis() - lastFetchTime));
+    text(`最後更新時間: ${d.toLocaleTimeString('zh-TW', { hour12: false })}`, 25, TOP_PANEL_H / 2 + 18);
+  }
 
   // 全區統計資料
   let totalSbi = 0;
@@ -488,30 +477,47 @@ function drawLoading() {
   textAlign(CENTER, CENTER);
   if (hasError) {
     fill(colors.warning);
-    text("即時資料載入失敗！", width / 2, height / 2 - 40);
+    text("資料載入失敗", width / 2, height / 2 - 20);
     fill(200);
     textSize(16);
-    text("請確認您的網路連線是否正常，系統將會在 60 秒後自動重新嘗試連線。", width / 2, height / 2 + 10);
+    text(`錯誤原因: ${errorMessage}\n系統將在 60 秒後自動重試。`, width / 2, height / 2 + 20);
   } else {
     fill(colors.bemp);
-    text(loadingState, width / 2, height / 2 - 30);
-    
-    // 繪製動態進度條
-    let barW = 400;
-    let barH = 10;
-    let barX = width / 2 - barW / 2;
-    let barY = height / 2 + 10;
-    
-    fill(25, 32, 51);
-    rect(barX, barY, barW, barH, 5);
-    fill(colors.sbi);
-    rect(barX, barY, barW * (loadingProgress / 100), barH, 5);
-    
-    fill(255);
-    textSize(16);
-    textFont('Share Tech Mono');
-    text(`${loadingProgress.toFixed(1)} %`, width / 2, barY + 30);
+    text("正在連線至新北市開放資料平台...", width / 2, height / 2);
   }
+}
+
+// 繪製右下角手動更新(重製)按鈕
+function drawRefreshButton() {
+  let r = 30;
+  let btnX = width - r - 30;
+  let btnY = height - r - 30;
+  let isHover = !isLoading && dist(mouseX, mouseY, btnX, btnY) < r;
+
+  push();
+  translate(btnX, btnY);
+  
+  // 按鈕底色與發光特效
+  if (isHover) {
+    fill(colors.bemp);
+    drawingContext.shadowBlur = 20;
+    drawingContext.shadowColor = colors.bemp.toString();
+  } else {
+    fill(45, 55, 80, 220);
+    drawingContext.shadowBlur = 0;
+  }
+  
+  noStroke();
+  circle(0, 0, r * 2);
+  drawingContext.shadowBlur = 0; 
+  
+  if (isLoading) rotate(frameCount * 0.1); // 讀取中呈現旋轉動畫
+  
+  fill(255);
+  textAlign(CENTER, CENTER);
+  textSize(30);
+  text("↻", 0, -2);
+  pop();
 }
 
 // ==========================================
@@ -527,6 +533,15 @@ function updateFilter() {
 }
 
 function mouseClicked() {
+  // 檢查是否點擊了右下角手動更新按鈕
+  let r = 30;
+  let btnX = width - r - 30;
+  let btnY = height - r - 30;
+  if (dist(mouseX, mouseY, btnX, btnY) < r) {
+    if (!isLoading) fetchData();
+    return;
+  }
+
   // 檢查是否點擊了篩選標籤
   if (mouseY >= TOP_PANEL_H && mouseY <= TOP_PANEL_H + filterPanelH) {
     for (let chip of filterChips) {
