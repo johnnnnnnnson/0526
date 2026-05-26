@@ -1,8 +1,8 @@
 // ==========================================
 // 1. 全域變數與設定
 // ==========================================
-const API_URL = 'https://data.ntpc.gov.tw/api/datasets/71cd87cf-ab44-4b8d-8d41-aea4b356948a/json?page=0&size=2000';
-const CSV_PATH = '新北市公共自行車租賃系統(YouBike2.0).csv';
+const API_URL = 'https://data.ntpc.gov.tw/api/v1/openapi/units/1130000';
+const CSV_PATH = '新北市公共自行車租賃系統(YouBike2.0).csv'; // 備用檔案名稱一併修改
 
 let stations = [];
 let filteredStations = [];
@@ -13,6 +13,12 @@ let lastFetchTime = 0;
 let updateInterval = 60000; // 60秒更新一次
 let isLoading = true;
 let hasError = false;
+let isLocalMode = false; // 標記是否為手動上傳檔案模式
+let fileInput; // 手動上傳檔案的 HTML 元素
+let loadingProgress = 0; // 載入進度百分比
+let loadingState = "建立連線中..."; // 載入狀態文字
+let dataModeStr = "初始化"; // 當前資料來源模式
+let officialDataTime = "載入中"; // 官方資料發布時間
 
 // 滾動與 UI 排版變數
 let scrollY = 0;
@@ -29,11 +35,16 @@ const CARD_MARGIN = 20;
 // 調色盤物件
 let colors;
 
+// Mappa 地圖相關變數
+let mappa;
+let myMap;
+let p5canvas;
+
 // ==========================================
 // 2. p5.js 生命週期函數
 // ==========================================
 function setup() {
-  createCanvas(windowWidth, windowHeight);
+  p5canvas = createCanvas(windowWidth, windowHeight);
   
   // 初始化 Cyberpunk 調色盤
   colors = {
@@ -45,20 +56,66 @@ function setup() {
     disabled: color(70, 78, 95)
   };
 
+  // 初始化 Mappa (使用 Leaflet 作為底圖引擎)
+  mappa = new Mappa('Leaflet');
+  const mapOptions = {
+    lat: 25.0115, // 新北市中心座標 (大約在板橋)
+    lng: 121.4619,
+    zoom: 12,
+    style: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" // 採用深色地圖以符合 Cyberpunk 風格
+  };
+  // 建立地圖並將 p5 畫布疊加上去
+  myMap = mappa.tileMap(mapOptions);
+  myMap.overlay(p5canvas);
+
   // 啟動資料拉取
   fetchData();
+
+  // 建立一個隱藏的檔案上傳按鈕 (當抓取失敗時提供手動上傳)
+  fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.csv';
+  fileInput.style.position = 'absolute';
+  fileInput.style.left = '50%';
+  fileInput.style.top = '60%';
+  fileInput.style.transform = 'translate(-50%, -50%)';
+  fileInput.style.display = 'none';
+  fileInput.style.color = '#fff';
+  fileInput.style.zIndex = '9999'; // 確保檔案按鈕不會被地圖圖層遮擋
+  fileInput.addEventListener('change', (e) => {
+    let file = e.target.files[0];
+    if (!file) return;
+    let reader = new FileReader();
+    reader.onload = (evt) => {
+      fileInput.style.display = 'none';
+      isLocalMode = true; // 切換至本地模式，停止自動重試
+      hasError = false;
+      processCSV(evt.target.result, "手動上傳 (本地 CSV)");
+    };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(fileInput);
 }
 
 function draw() {
-  background(colors.bg);
+  clear(); // 清除畫布背景，讓底下的 Mappa 地圖可以透出來
+  background(11, 14, 23, 190); // 覆蓋一層半透明深色遮罩，讓卡片與文字能清楚閱讀
 
-  if (isLoading) {
+  if (isLoading || hasError) {
     drawLoading();
+
+    // 即使連線失敗，也允許每隔 60 秒嘗試重新拉取資料
+    if (!isLocalMode && millis() - lastFetchTime > updateInterval) {
+      isLoading = true;
+      hasError = false;
+      fetchData();
+    }
+
     return;
   }
 
   // 定期資料刷新機制
-  if (millis() - lastFetchTime > updateInterval) {
+  if (!isLocalMode && millis() - lastFetchTime > updateInterval) {
     fetchData();
   }
 
@@ -104,26 +161,67 @@ function draw() {
 }
 
 function windowResized() {
-  resizeCanvas(windowWidth, windowHeight);
-  updateFilterLayout();
+  // 確保 p5.js 畫布引擎已建立，避免過早觸發造成白畫面
+  if (typeof drawingContext !== 'undefined') {
+    resizeCanvas(windowWidth, windowHeight);
+    updateFilterLayout();
+  }
 }
 
 // ==========================================
 // 3. 資料獲取與解析
 // ==========================================
 async function fetchData() {
+  // 每次進入 Fetch 都先更新計時器，避免失敗後引發無限迴圈或當機
+  lastFetchTime = millis();
+  
+  loadingProgress = 0;
+  loadingState = "建立連線中...";
+
   try {
-    let response = await fetch(API_URL);
+    // 1. 在原 API 網址加上時間戳，確保抓到最新狀態而不被代理伺服器快取
+    let targetUrl = API_URL + '?t=' + Date.now();
+    // 2. 使用公共的 CORS 代理伺服器發送 GET 請求，繞過瀏覽器 CORS 限制
+    let proxyUrl = 'https://corsproxy.io/?' + encodeURIComponent(targetUrl);
+
+    let response = await fetch(proxyUrl);
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-    let rawData = await response.json();
-    processData(rawData);
+    
+    // 建立 clone 以安全地解析 JSON，避免我們手動分塊導致中文字元截斷報錯
+    let responseClone = response.clone();
+    
+    loadingState = "下載資料中...";
+    
+    // 使用 ReadableStream 即時讀取下載進度
+    const reader = response.body.getReader();
+    const contentLength = +response.headers.get('Content-Length');
+    // 代理伺服器可能不提供檔案大小，若無則以台北市 YouBike 資料量約 600KB 進行預估
+    const estimatedLength = contentLength ? contentLength : 600000; 
+    
+    let receivedLength = 0;
+    let chunks = [];
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      receivedLength += value.length;
+      // 計算百分比，最多卡在 99.9% 直到解析完成
+      loadingProgress = min((receivedLength / estimatedLength) * 100, 99.9);
+    }
+    
+    loadingState = "解析資料中...";
+    loadingProgress = 100;
+    
+    // 讓原生 .json() 安全處理字串與格式，避免我們手動分塊導致的中文字元截斷錯誤
+    let rawData = await responseClone.json();
+    processData(rawData, "即時連線");
   } catch (apiError) {
     console.warn("API Fetch 失敗 (可能為 CORS 或網路異常)，啟動降級機制讀取本地 CSV...", apiError);
     try {
       let csvResponse = await fetch(CSV_PATH);
       if (!csvResponse.ok) throw new Error('本地 CSV 檔案不存在或無法讀取');
       let csvText = await csvResponse.text();
-      processCSV(csvText);
+      processCSV(csvText, "降級備用 (本地 CSV)");
     } catch (csvError) {
       console.error("本地 CSV 也讀取失敗！", csvError);
       hasError = true;
@@ -132,7 +230,7 @@ async function fetchData() {
   }
 }
 
-function processCSV(csvText) {
+function processCSV(csvText, mode = "本地 CSV") {
   let lines = csvText.trim().split('\n');
   let headers = lines[0].split(',').map(h => h.trim().replace(/['"]/g, ''));
   let data = [];
@@ -144,10 +242,23 @@ function processCSV(csvText) {
     headers.forEach((h, idx) => { obj[h] = row[idx]; });
     data.push(obj);
   }
-  processData(data);
+  processData(data, mode);
 }
 
-function processData(data) {
+function processData(data, mode = "即時連線") {
+  dataModeStr = mode;
+  // 容錯處理：如果 API 回傳的不是陣列而是物件包裹，試著提取出來
+  if (!Array.isArray(data)) {
+    if (data && Array.isArray(data.result)) data = data.result;
+    else if (data && Array.isArray(data.records)) data = data.records;
+    else data = [];
+  }
+
+  // 嘗試取得官方資料更新時間
+  if (data.length > 0) {
+    officialDataTime = data[0].srcUpdateTime || data[0].updateTime || data[0].mday || "未知";
+  }
+
   let newDistricts = new Set(['全部']);
   let newStations = [];
 
@@ -190,6 +301,7 @@ function processData(data) {
   
   lastFetchTime = millis();
   isLoading = false;
+  hasError = false;
 }
 
 // ==========================================
@@ -321,14 +433,17 @@ function drawTopPanel() {
   textFont('Rajdhani');
   textSize(34);
   textAlign(LEFT, CENTER);
-  text("YOUBIKE 2.0 MONITOR", 25, TOP_PANEL_H / 2 - 8);
+  text("NEW TAIPEI YOUBIKE 2.0", 25, TOP_PANEL_H / 2 - 8);
 
   // 更新時間
   textFont('Noto Sans TC');
   textSize(13);
-  fill(150);
   let d = new Date(Date.now() - (millis() - lastFetchTime));
-  text(`最後更新時間: ${d.toLocaleTimeString('zh-TW', { hour12: false })}`, 25, TOP_PANEL_H / 2 + 18);
+  let fetchTimeStr = d.toLocaleTimeString('zh-TW', { hour12: false });
+  
+  // 若非即時連線，用警戒色提示使用者這不是最新資料
+  fill(dataModeStr.includes("即時連線") ? 150 : colors.warning);
+  text(`連線狀態: ${dataModeStr} | 抓取時間: ${fetchTimeStr} | 官方更新時間: ${officialDataTime}`, 25, TOP_PANEL_H / 2 + 18);
 
   // 全區統計資料
   let totalSbi = 0;
@@ -440,10 +555,31 @@ function drawLoading() {
   textAlign(CENTER, CENTER);
   if (hasError) {
     fill(colors.warning);
-    text("資料載入失敗，請確認網路連線或 CSV 檔案是否存在。", width / 2, height / 2);
+    text("資料載入失敗！", width / 2, height / 2 - 40);
+    fill(200);
+    textSize(16);
+    text("請確認是否使用 Live Server 啟動 (避免瀏覽器 file:// 阻擋)\n或點擊下方按鈕，直接手動選擇您已下載的 CSV 檔案：", width / 2, height / 2 + 10);
+    if (fileInput) fileInput.style.display = 'block';
   } else {
+    if (fileInput) fileInput.style.display = 'none';
     fill(colors.bemp);
-    text("建立連線中... 載入 YouBike 2.0 即時數據", width / 2, height / 2);
+    text(loadingState, width / 2, height / 2 - 30);
+    
+    // 繪製動態進度條
+    let barW = 400;
+    let barH = 10;
+    let barX = width / 2 - barW / 2;
+    let barY = height / 2 + 10;
+    
+    fill(25, 32, 51);
+    rect(barX, barY, barW, barH, 5);
+    fill(colors.sbi);
+    rect(barX, barY, barW * (loadingProgress / 100), barH, 5);
+    
+    fill(255);
+    textSize(16);
+    textFont('Share Tech Mono');
+    text(`${loadingProgress.toFixed(1)} %`, width / 2, barY + 30);
   }
 }
 
